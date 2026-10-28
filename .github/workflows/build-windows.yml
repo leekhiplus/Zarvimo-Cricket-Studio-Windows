@@ -1,0 +1,128 @@
+name: Build Windows App
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Windows desktop app
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      # Finds the "desktop" Gradle project (next to the app/ folder). If the repository only holds the project ZIP
+      # (GitHub does not unpack ZIPs on upload) the ZIP is extracted and used.
+      - name: Locate desktop project
+        id: locate
+        shell: pwsh
+        run: |
+          function Find-Desktop($base) {
+            Get-ChildItem -Path $base -Recurse -Depth 5 -Filter settings.gradle.kts -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.Directory.Name -eq 'desktop' -and
+                (Test-Path (Join-Path $_.Directory.Parent.FullName 'app/src/main/java'))
+              } | Select-Object -First 1
+          }
+          $found = Find-Desktop $env:GITHUB_WORKSPACE
+          if (-not $found) {
+            Write-Host "No ready desktop project in the repository. Looking for a ZIP to extract..."
+            $out = Join-Path $env:GITHUB_WORKSPACE '_zarvimo_extracted'
+            New-Item -ItemType Directory -Force -Path $out | Out-Null
+            $i = 0
+            $zips = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -Depth 3 -Filter *.zip -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' -and $_.FullName -notmatch '_zarvimo_extracted' }
+            foreach ($z in $zips) {
+              $i++
+              $dest = Join-Path $out "$i"
+              Write-Host "Extracting $($z.FullName)"
+              try { Expand-Archive -Path $z.FullName -DestinationPath $dest -Force } catch { Write-Host "Could not unzip: $_"; continue }
+              $found = Find-Desktop $dest
+              if ($found) { break }
+            }
+          }
+          if (-not $found) {
+            Write-Host "::error::No 'desktop' project found. Upload the full project (app/, desktop/, ...) or keep the project ZIP in the repository root."
+            Get-ChildItem -Recurse -Depth 3 $env:GITHUB_WORKSPACE | Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' } | Select-Object -First 120 FullName
+            exit 1
+          }
+          $dir = $found.Directory.FullName.Replace('\', '/')
+          Write-Host "Desktop project: $dir"
+          "dir=$dir" >> $env:GITHUB_OUTPUT
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      # FFmpeg does the H.264/AAC encoding and RTMP sending. It is bundled next to the app so users need no install.
+      # If the download fails the build still succeeds; the app then looks for ffmpeg.exe in PATH.
+      - name: Download FFmpeg
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $dir = '${{ steps.locate.outputs.dir }}'
+          $url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip'
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_x -Force
+          $exe = Get-ChildItem -Path ffmpeg_x -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path "$dir/resources/common" | Out-Null
+          Copy-Item $exe.FullName "$dir/resources/common/ffmpeg.exe"
+          Get-Item "$dir/resources/common/ffmpeg.exe" | Select-Object FullName, Length
+
+      # 1) Portable app folder (no WiX needed) - this is the main result.
+      - name: Build portable app
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: gradle --no-daemon --stacktrace createDistributable
+
+      - name: Zip portable app
+        shell: pwsh
+        run: |
+          $dir = '${{ steps.locate.outputs.dir }}'
+          $app = Get-ChildItem "$dir/build/compose/binaries/main/app" -Directory | Select-Object -First 1
+          if (-not $app) { Write-Host "::error::createDistributable produced no app folder"; exit 1 }
+          Compress-Archive -Path $app.FullName -DestinationPath "$env:GITHUB_WORKSPACE/Zarvimo-Live-Cricket-Studio-Windows-portable.zip" -Force
+          Get-Item "$env:GITHUB_WORKSPACE/Zarvimo-Live-Cricket-Studio-Windows-portable.zip" | Select-Object FullName, Length
+
+      - name: Upload portable app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zarvimo-Live-Cricket-Studio-Windows-portable
+          path: Zarvimo-Live-Cricket-Studio-Windows-portable.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      # 2) Installers (.msi / .exe). Optional: a failure here does not fail the build.
+      - name: Build installers
+        id: installers
+        continue-on-error: true
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: gradle --no-daemon --stacktrace packageMsi packageExe
+
+      - name: Upload installers
+        if: steps.installers.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zarvimo-Live-Cricket-Studio-Windows-installers
+          path: |
+            ${{ steps.locate.outputs.dir }}/build/compose/binaries/main/msi/*.msi
+            ${{ steps.locate.outputs.dir }}/build/compose/binaries/main/exe/*.exe
+          if-no-files-found: warn
+          retention-days: 30
